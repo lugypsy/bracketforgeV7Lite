@@ -1,7 +1,7 @@
-# app.py — BracketForge v7 (LITE)
-# Fresh build with: CSV upload (+ Excel if enabled), manual roster, regen window,
-# objectives (Max Points / Max SB / Best Points per Energy), opener reserve,
-# cycles calc, SB/Mag/Grand totals, per-player plan, summary, CSV export.
+# app.py — BracketForge v7.1 (LITE)
+# Fixes: Auto-Assign updates the table (session_state), fills roles for all rows.
+# Features: CSV upload (+ Excel if enabled), manual roster, regen window, objectives,
+# opener reserve, cycles calc, SB/Mag/Grand totals, per-player plan, CSV export.
 
 import io, csv
 from typing import List, Dict, Tuple
@@ -17,8 +17,8 @@ if EXCEL_SUPPORT:
 else:
     pd = None
 
-st.set_page_config(page_title="BracketForge v7", page_icon="⚔️", layout="wide")
-st.title("⚔️ BracketForge — War Role Calculator (v7, LITE)")
+st.set_page_config(page_title="BracketForge v7.1", page_icon="⚔️", layout="wide")
+st.title("⚔️ BracketForge — War Role Calculator (v7.1, LITE)")
 
 # ----------------------------
 # Built-in points matrix (levels 1–20)
@@ -58,7 +58,6 @@ ENERGY_COST_MAG = 2
 st.sidebar.header("Setup")
 
 team_size = st.sidebar.number_input("How many players?", min_value=1, max_value=100, value=25, step=1)
-
 duration_min = st.sidebar.number_input("Play window (minutes)", min_value=5, max_value=120, value=30, step=5)
 
 regen_mode = st.sidebar.selectbox("Energy regen", ["Standard (1 per 3 min)", "GLW (1 per 1 min)", "Custom"], index=0)
@@ -83,6 +82,9 @@ with st.sidebar.expander("Points matrix (built-in)"):
 # ----------------------------
 # Roster I/O
 # ----------------------------
+DATA_KEY = "roster_data_v7_lite"   # holds the current table content (list of dicts)
+WIDGET_KEY = "roster_editor_v7_lite"
+
 def default_roster(n: int):
     return [{"name": f"Player {i}", "sb_level": 0, "mag_level": 0, "role": "— Select —"} for i in range(1, n+1)]
 
@@ -110,6 +112,11 @@ else:
 
 uploaded = st.file_uploader(upload_help, type=upload_types)
 
+# Seed session_state on first run or when team size changes
+if DATA_KEY not in st.session_state:
+    st.session_state[DATA_KEY] = default_roster(team_size)
+
+# If user uploaded a file, replace session data with file content
 try:
     if uploaded:
         filename = uploaded.name.lower()
@@ -138,16 +145,23 @@ try:
                 roster_in = normalize_rows(df[["name","sb_level","mag_level","role"]].to_dict("records"))
         else:
             roster_in = default_roster(team_size)
+        st.session_state[DATA_KEY] = roster_in
+        st.success(f"Loaded roster from file: {len(roster_in)} players.")
         team_size = len(roster_in)
-        st.info(f"Detected team size from file: **{team_size}**")
-    else:
-        roster_in = default_roster(team_size)
 except Exception as e:
     st.error(f"Failed to read file: {e}")
-    roster_in = default_roster(team_size)
 
+# If team_size was changed manually, resize the roster
+current_len = len(st.session_state[DATA_KEY])
+if team_size != current_len:
+    if team_size > current_len:
+        st.session_state[DATA_KEY] += default_roster(team_size - current_len)
+    else:
+        st.session_state[DATA_KEY] = st.session_state[DATA_KEY][:team_size]
+
+# Render editor using the session-stored data
 edited = st.data_editor(
-    roster_in,
+    st.session_state[DATA_KEY],
     num_rows="dynamic",
     use_container_width=True,
     hide_index=True,
@@ -157,11 +171,13 @@ edited = st.data_editor(
         "mag_level": st.column_config.NumberColumn("Mag Level", min_value=0, max_value=20, step=1),
         "role":      st.column_config.SelectboxColumn("Assigned Role", options=["— Select —"] + ROLES_ORDER),
     },
-    key="roster_editor_v7_lite",
+    key=WIDGET_KEY,
 )
+# Keep manual edits
+st.session_state[DATA_KEY] = edited
 
 # ----------------------------
-# Energy math & role evaluation
+# Energy & evaluation helpers
 # ----------------------------
 def spendable_energy_per_player(start: int, cap: int, duration_min: int, tick_minutes: int) -> int:
     base = min(start, cap)
@@ -169,26 +185,25 @@ def spendable_energy_per_player(start: int, cap: int, duration_min: int, tick_mi
     return base + ticks
 
 def evaluate_role(role: str, sb_level: int, mag_level: int, energy_spendable: int):
-    # returns (sb_casts, mag_casts, sb_points, mag_points, energy_used)
     if role == "SB-only (3 SB)":
-        sb_casts = energy_spendable // ENERGY_COST_SB
+        sb_casts = energy_spendable // 7
         mag_casts = 0
     elif role == "Mag-only (10 Mag)":
         sb_casts = 0
-        mag_casts = energy_spendable // ENERGY_COST_MAG
+        mag_casts = energy_spendable // 2
     elif role == "2 SB + 3 Mag":
-        units = energy_spendable // (2*ENERGY_COST_SB + 3*ENERGY_COST_MAG)  # 20
+        units = energy_spendable // 20
         sb_casts = 2*units
         mag_casts = 3*units
     elif role == "1 SB + 7 Mag":
-        units = energy_spendable // (ENERGY_COST_SB + 7*ENERGY_COST_MAG)    # 21
+        units = energy_spendable // 21
         sb_casts = 1*units
         mag_casts = 7*units
     else:
         sb_casts = mag_casts = 0
     sb_pts = sb_casts * pts_sb(sb_level)
     mag_pts = mag_casts * pts_mag(mag_level)
-    energy_used = sb_casts*ENERGY_COST_SB + mag_casts*ENERGY_COST_MAG
+    energy_used = sb_casts*7 + mag_casts*2
     return sb_casts, mag_casts, sb_pts, mag_pts, energy_used
 
 def auto_assign(rows, energy_spendable: int, objective: str):
@@ -204,7 +219,7 @@ def auto_assign(rows, energy_spendable: int, objective: str):
                 score = (total_pts, sb_casts, mag_casts)
             elif objective == "Max SB casts":
                 score = (sb_casts, total_pts, mag_casts)
-            else:  # Best Points per Energy
+            else:
                 score = (ppe, sb_casts, total_pts)
             cand.append((score, role))
         best = max(cand, key=lambda x: x[0]) if cand else (((0,0,0), "— Select —"))
@@ -213,9 +228,11 @@ def auto_assign(rows, energy_spendable: int, objective: str):
 
 energy_spendable = spendable_energy_per_player(start_energy, energy_cap, duration_min, tick_minutes)
 
+# Auto-Assign: write back to session and rerun so the editor shows new roles
 if auto_clicked:
-    edited = auto_assign(edited, energy_spendable, objective)
+    st.session_state[DATA_KEY] = auto_assign(st.session_state[DATA_KEY], energy_spendable, objective)
     st.success(f"Auto-assign complete ({objective}). Spendable energy per player ≈ {energy_spendable}.")
+    st.experimental_rerun()
 
 # ----------------------------
 # Totals & cycles
@@ -258,7 +275,7 @@ def compute_totals(rows, energy_spendable: int, reserve_opener: bool):
     return per, total_sb_casts, total_mag_casts, total_sb_points, total_mag_points, grand_total, total_energy_used, cycles, sb_leftover, leftover_mag, status
 
 (per_rows, tot_sb_casts, tot_mag_casts, tot_sb_points, tot_mag_points,
- grand_total, total_energy_used, cycles, sb_left, mag_left, status) = compute_totals(edited, energy_spendable, reserve_opener)
+ grand_total, total_energy_used, cycles, sb_left, mag_left, status) = compute_totals(st.session_state[DATA_KEY], energy_spendable, reserve_opener)
 
 # ----------------------------
 # Summary
@@ -299,7 +316,7 @@ w = csv.DictWriter(out, fieldnames=plan_cols)
 w.writeheader()
 w.writerows([{k: r[k] for k in plan_cols} for r in per_rows])
 st.download_button("Download Plan CSV", data=out.getvalue().encode("utf-8"),
-                   file_name="bracketforge_v7_plan.csv", mime="text/csv")
+                   file_name="bracketforge_v7_1_plan.csv", mime="text/csv")
 
 # ----------------------------
 # Team Role Summary
@@ -307,7 +324,7 @@ st.download_button("Download Plan CSV", data=out.getvalue().encode("utf-8"),
 st.divider()
 st.subheader("Team Role Summary")
 role_counts = {}
-for r in edited:
+for r in st.session_state[DATA_KEY]:
     if r["role"] != "— Select —":
         role_counts[r["role"]] = role_counts.get(r["role"], 0) + 1
 
